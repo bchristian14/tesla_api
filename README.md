@@ -5,10 +5,12 @@ Requires: python 3.7+, aiohttp
 update variables within power_manager.py to reflect your own email & password, and adjust summer season months and peak hours as desired. The script automatically subtracts 10 minutes from the start of each peak window, so this can be called via cronjobs a few minutes prior to the actual peak start time, and immediately following conclusion of the peak window.
 
 The seasons and peak windows are already set for SRP's pricing plans for E-15 and E-27 price plans as of 12/15/2020 (below).
+
 Summer - 5/1-10/31 2pm-8pm
 Winter - 11/1-4/30 5am-9am and 5pm-9pm
 
 The crontab I setup for this script is below. I intentionally let it run weekends as well, and handle weekend/weekdays within the python script. The script does not currently account for holidays.
+
 #run for peak-starts at xx:57
 57 4,13,16 * * * python3.7 /root/tesla_api/power_manager.py >> /var/log/power_manager.log
 #run for peak-ends at xx:03
