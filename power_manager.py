@@ -1,87 +1,79 @@
+from datetime import datetime as dt, timedelta
+from os import environ
+import dateutil.tz
 import asyncio
-from datetime import datetime, timedelta
-from tesla_api import TeslaApiClient
+from tesla_api.tesla_api import TeslaApiClient
 
-email = 'yourEmail@domain.com'
-password = 'yourTeslaAccountPassword'
-
-# set summer start/end months
+#pricing season start/end
 summer_first_month = 5
 summer_last_month = 10
+# Peak pricing start/end hours
+timezone = 'US/Arizona' 
+summer_start = 14
+summer_end = 20
+winter_morning_start = 5
+winter_morning_end = 9
+winter_evening_start = 17
+winter_evening_end = 21
 
-# set peak start/end times (in 24-hour format; eg. 17 = 5pm)
-summer_peak_start_hour = 14
-summer_peak_end_hour = 20
-winter_morning_peak_start_hour = 5
-winter_morning_peak_end_hour = 9
-winter_evening_peak_start_hour = 17
-winter_evening_peak_end_hour = 21
+az = dateutil.tz.gettz(timezone)
+current = dt.now(tz=az)
+email = environ['email']
+pwrd = environ['pwrd']
 
-# fetch current datetime
-current = datetime.now()
-print("\ncurrent date & time is {}".format(current))
+
+def lambda_handler(event, context):
+    asyncio.run(main())
+    return
 
 
 async def main():
-    client = TeslaApiClient(email, password)
+    client = TeslaApiClient(email, pwrd)
     energy_sites = await client.list_energy_sites()
-    print("Number of energy sites = %d" % (len(energy_sites)))
     assert(len(energy_sites)==1)
     cur_mode = await energy_sites[0].get_operating_mode()
-    print("current operating mode = {}\n".format(cur_mode))
-    if await season_check() == "winter":
-        # change peak period integers into time objects; begin peak 10 minutes early
-        morning_start = (datetime(2021,1,1,winter_morning_peak_start_hour) - timedelta(minutes=10)).time()
-        evening_start = (datetime(2021,1,1,winter_evening_peak_start_hour) - timedelta(minutes=10)).time()
-        morning_end = datetime(2021,1,1,winter_morning_peak_end_hour).time()
-        evening_end = datetime(2021,1,1,winter_evening_peak_end_hour).time()
-        # check if weekday and within peak hours
-        if current.weekday() < 5 and (
-            morning_start < current.time() < morning_end or
-            evening_start < current.time() < evening_end):
-            print("PEAK hours in effect!")
-            # TODO: skip changing mode if mode is already self_consumption
-            await set_onpeak(energy_sites)
+    print(f"Current Mode: {cur_mode}")
+    season = "summer" if (
+        summer_first_month <= current.month <= summer_last_month
+        ) else "winter"
+    if await is_peak(season):
+        print(f"Pricing: {season.upper()} ON-PEAK")
+        if cur_mode == "self_consumption":
+            print("Mode already set to self-consumption.")
         else:
-            print("it is currently OFF-PEAK")
-            # TODO: skip changing mode if mode is already backup
-            await set_offpeak(energy_sites)
-    else: # it is summer
-        # change peak period integers into time objects; begin peak 10 minutes early
-        peak_start = (datetime(2021,1,1,summer_peak_start_hour) - timedelta(minutes=10)).time()
-        peak_end = datetime(2021,1,1,summer_peak_end_hour).time()
-        # check if weekday and within peak hours
-        if current.weekday() < 5 and (peak_start < current.time() < peak_end):
-            print("PEAK hours in effect!")
-            # TODO: skip changing mode if mode is already self_consumption
-            await set_onpeak(energy_sites)
+            print("Changing to self-consumption.")
+            await energy_sites[0].set_operating_mode_self_consumption()
+            new_mode = await energy_sites[0].get_operating_mode()
+            print(f"New Mode: {new_mode}")
+    else:
+        print(f"Pricing: {season.upper()} OFF-PEAK")        
+        if cur_mode == "backup":
+            print("Mode already set to backup.")
         else:
-            print("it is currently OFF-PEAK")
-            # TODO: skip changing mode if mode is already backup
-            await set_offpeak(energy_sites)
-    print("\n\n")
+            print("Changing to backup.")
+            await energy_sites[0].set_operating_mode_backup()
+            new_mode = await energy_sites[0].get_operating_mode()
+            print(f"New Mode: {new_mode}")            
     await client.close()
 
 
-async def set_offpeak(energy_sites):
-    print("attempting to change mode to backup-only (backup)...")
-    await energy_sites[0].set_operating_mode_backup()
-    new_mode = await energy_sites[0].get_operating_mode()
-    print("operating mode set to: {}".format(new_mode))
-
-async def set_onpeak(energy_sites):
-    print("attempting to change mode to self powered (self-consumption)...")
-    await energy_sites[0].set_operating_mode_self_consumption()
-    new_mode = await energy_sites[0].get_operating_mode()
-    print("operating mode set to: {}".format(new_mode))
-
-# season check
-async def season_check():
-    if (summer_first_month <= current.month <= summer_last_month):
-        print("summer-season is in effect")
-        return("summer")
-    else:
-        print("winter-season is in effect")
-        return("winter")
-
-asyncio.run(main())
+async def is_peak(season):
+    if season == "winter": # is it winter
+        morn_start = (dt.strptime(str(winter_morning_start),"%H")
+                      - timedelta(minutes=10)
+                      ).time()
+        morn_end = dt.strptime(str(winter_morning_end),"%H").time()
+        eve_start = (dt.strptime(str(winter_evening_start), "%H")
+                     - timedelta(minutes=10)
+                     ).time()
+        eve_end = dt.strptime(str(winter_evening_end), "%H").time()
+        # True if weekday between peak times
+        return current.weekday() < 5 and \
+               (morn_start < current.time() < morn_end or 
+                eve_start < current.time() < eve_end)
+    else: # it is summer
+        start = (dt.strptime(str(summer_peak_start_hour),"%H") 
+                 - timedelta(minutes=10)).time()
+        end = dt.strptime(str(summer_peak_end_hour),"%H").time()
+        # True if weekday between peak times
+        return current.weekday() < 5 and (start < current.time() < end)
