@@ -1,21 +1,23 @@
 import asyncio
 import base64
+import hashlib
 import json
+import re
+import secrets
 from datetime import datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 
 from .energy import Energy
-from .exceptions import ApiError, AuthenticationError, VehicleUnavailableError, JWTDecodeError
+from .exceptions import ApiError, AuthenticationError, VehicleUnavailableError
 from .vehicle import Vehicle
 
 TESLA_API_BASE_URL = "https://owner-api.teslamotors.com/"
-V2TOKEN_URL = TESLA_API_BASE_URL + "oauth/token"
-V3TOKEN_URL = "https://auth.tesla.com/oauth2/v3/token"
+TOKEN_URL = "https://auth.tesla.com/oauth2/v3/authorize"
 API_URL = TESLA_API_BASE_URL + "api/1"
 
-V3OAUTH_CLIENT_ID = "ownerapi"
-V2OAUTH_CLIENT_ID = "81527cff06843c8634fdc09e8ac0abefb46ac849f38fe1e431c2ef2106796384"
+OAUTH_CLIENT_ID = "81527cff06843c8634fdc09e8ac0abefb46ac849f38fe1e431c2ef2106796384"
 OAUTH_CLIENT_SECRET = "c7257eb71a564034f9419ee651c7d0e5f7aa6bfbd18bafb5c5c033b093bb2fa3"
 
 
@@ -24,35 +26,18 @@ class TeslaApiClient:
     callback_wake_up = None  # Called when attempting to wake a vehicle.
     timeout = 30  # Default timeout for operations such as Vehicle.wake_up().
 
-    def __init__(self, email=None, password=None, code=None, token=None, short_lived_v3token=True, on_new_token=None):
+    def __init__(self, email=None, password=None, token=None, on_new_token=None):
         """Creates client from provided credentials.
-
-        Email and Password logins (with MFA support) require client side javascript
-        to generate a one time code which can be used to create oauth tokens.
-        For more information see:
-        https://tesla-api.timdorr.com/api-basics/authentication#step-2-obtain-an-authorization-code
-        and use the 'code' option to use this module.
-        This is currently not implemented and raises an exception.
-   
         If token is not provided, or is no longer valid, then a new token will
-        be fetched if a code (obtained from the tesla auth webpage) is available.
-        code consist of the itself + a code_verifier, e.g
-        code = {'code': 'codedata', 'code_verifier': 'verification data'}
-        
-        Per default we use short lived access tokens which need refreshing every
-        300 seconds. For long running sessions it is possible to use 'old v3 style'
-        access tokens. For this set short_lived_v3token to False
-        
+        be fetched if email and password are provided.
         If on_new_token is provided, it will be called with the newly created token.
         This should be used to save the token, both after initial login and after an
         automatic token renewal. The token is returned as a string and can be passed
         directly into this constructor.
         """
-        if email or password:
-            raise Exception("Email and Password logins currently not supported")
-        assert token is not None or code is not None or (email is not None and password is not None)
-        self._short_lived_v3token = short_lived_v3token
-        self._code = json.loads(code) if code else None
+        assert token is not None or (email is not None and password is not None)
+        self._email = email
+        self._password = password
         self._token = json.loads(token) if token else None
         self._new_token_callback = on_new_token
         self._session = aiohttp.ClientSession()
@@ -66,80 +51,88 @@ class TeslaApiClient:
     async def close(self):
         await self._session.close()
 
-    def decode_jwt_token(self, jwt_token):
-        try:
-            headers_enc, payload_enc, verify_signature = jwt_token.split('.')
-            payload_enc += '=' * (-len(payload_enc) % 4)  # add padding
-            payload = json.loads(base64.b64decode(payload_enc).decode("utf-8"))
-            return payload
-        except:
-            raise JWTDecodeError()
+    async def _get_new_token(self):
+        code_verifier = secrets.token_urlsafe(64)
+        code_challenge = base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode()).hexdigest().encode())
+        state = secrets.token_urlsafe(16)
 
-    async def _get_token(self, url, data, headers={}):
-        request_data = {
-            "client_secret": OAUTH_CLIENT_SECRET,
-        }
-        request_data.update(data)
-
-        async with self._session.post(url, data=request_data, headers=headers) as resp:
-            response_json = await resp.json()
-            if resp.status == 401:
-                raise AuthenticationError(response_json)
-        if "error" in response_json:
-            raise AuthenticationError(response_json)
-        return response_json
-
-    async def _get_new_token_with_userpass(self):
-        #TODO ... do some HTML magic here
-        raise Exception('username / password token retrival not implemented yet')
-
-    async def _get_new_token_with_code(self):
-        request_data = {"grant_type": "authorization_code", "client_id": V3OAUTH_CLIENT_ID,
-            "code": self._code["code"], "code_verifier": self._code["code_verifier"],
+        params = {
+            "client_id": "ownerapi",
+            "code_challenge": code_challenge.decode(),
+            "code_challenge_method": "S256",
             "redirect_uri": "https://auth.tesla.com/void/callback",
+            "response_type": "code",
+            "scope": "openid email offline_access",
+            "state": state
         }
-        return await self._get_token(V3TOKEN_URL, request_data)
+
+        async with self._session.get(TOKEN_URL, params=params) as resp:
+            response_page = await resp.text()
+
+        input_fields = (f.group(1) for f in re.finditer(r"<input ([^>]+)>", response_page))
+        input_fields = ((re.search(r'name="(.*?)"', f), re.search(r'value="(.*?)"', f))
+                        for f in input_fields)
+        form_data = {name.group(1): value.group(1) if value else ""
+                     for name, value in input_fields}
+        form_data["identity"] = self._email
+        form_data["credential"] = self._password
+
+        async with self._session.post(TOKEN_URL, data=form_data, params=params, allow_redirects=False) as resp:
+            if resp.status == 401:
+                raise AuthenticationError("Incorrect login")
+            if resp.status == 200:
+                page = await resp.text()
+                errors = json.loads(re.search(r"var messages = (.*);", page).group(1))
+                raise AuthenticationError(errors.get("_", errors))
+
+            redirect_location = resp.headers["Location"]
+            args = parse_qs(urlparse(redirect_location).query)
+            if args["state"][0] != state:
+                raise AuthenticationError("Incorrect state (possible CSRF attack).")
+
+        data = {
+            "grant_type": "authorization_code",
+            "client_id": "ownerapi",
+            "code": args["code"][0],
+            "code_verifier": code_verifier,
+            "redirect_uri": "https://auth.tesla.com/void/callback"
+        }
+        async with self._session.post("https://auth.tesla.com/oauth2/v3/token", json=data) as resp:
+            bearer_token = await resp.json()
+
+        params = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "client_id": OAUTH_CLIENT_ID,
+            "client_secret": OAUTH_CLIENT_SECRET
+        }
+        headers = {"Authorization": "Bearer {}".format(bearer_token["access_token"])}
+        async with self._session.post("https://owner-api.teslamotors.com/oauth/token",
+                                      headers=headers, params=params) as resp:
+            access_token = await resp.json()
+
+        # Replace the broken refresh token with the token from the previous step.
+        access_token["refresh_token"] = bearer_token["refresh_token"]
+
+        # Send token to application via callback.
+        if self._new_token_callback:
+            asyncio.create_task(self._new_token_callback(json.dumps(access_token)))
+
+        return access_token
 
     async def _refresh_token(self, refresh_token):
-        request_data = {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": V3OAUTH_CLIENT_ID, "scope": "openid email offline_access"}
-        v3_token_data = await self._get_token(V3TOKEN_URL, request_data)
-        if self._short_lived_v3token:
-            return v3_token_data
-        request_data = {"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "client_id": V2OAUTH_CLIENT_ID}
-        return await self._get_token(V2TOKEN_URL, request_data, headers = {"Authorization": "Bearer {}".format(v3_token_data["access_token"])})
+        data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
+        return await self._get_token(data)
 
     async def authenticate(self):
         if not self._token:
-            if self._code: # First we check of if have a webcode to generate tokens
-                self._token = await self._get_new_token_with_code()
-            elif self._email: # Otherwise we try the user / password combo
-                self._token = await self._get_new_token_with_userpass()
-            else:
-                raise AuthenticationError('token or code or username/password missing')
+            self._token = await self._get_new_token()
 
-        if "expires_at" not in self._token:
-            try:
-                jwt_data = self.decode_jwt_token(self._token["access_token"])
-            except JWTDecodeError:
-                self._token["expires_at"] = self._token["created_at"] + self._token["expires_in"]
-            else:
-                self._token["expires_at"] = jwt_data["exp"]
-        expiration_date = datetime.fromtimestamp(self._token["expires_at"])
-        
+        expiry_time = timedelta(seconds=self._token["expires_in"])
+        expiration_date = datetime.fromtimestamp(self._token["created_at"]) + expiry_time
+
         if datetime.utcnow() >= expiration_date:
-            token_data = await self._refresh_token(self._token["refresh_token"])
-            # We need to distinguish between new v3 and old v2 style tokens here.
-            # v2 refresh tokens CAN NOT be used anymore for refresh they return an error in the Tesla API backend
-            if self._short_lived_v3token:
-                self._token = token_data
-            else:
-                self._token["access_token"] = token_data["access_token"]
-                self._token["expires_at"] = token_data["created_at"] + token_data["expires_in"]
+            self._token = await self._refresh_token(self._token["refresh_token"])
 
-            # Send token to application via callback.
-            if self._new_token_callback:
-                asyncio.create_task(self._new_token_callback(json.dumps(self._token)))
-                
     def _get_headers(self):
         return {"Authorization": "Bearer {}".format(self._token["access_token"])}
 
